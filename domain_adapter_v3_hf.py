@@ -16,11 +16,7 @@ from datasets import load_dataset
 from optimum.bettertransformer import BetterTransformer
 
 
-#  TBD items
-#  Port domain adapter and attention mechanisms into custom module package
-#  FT dataset
-#
-#
+
 class MemoryWeightedAttention(nn.Module):
     """Adds retrieval-weighted attention with compressed valence representations."""
 
