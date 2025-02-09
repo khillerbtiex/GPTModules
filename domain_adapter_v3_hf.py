@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers.optimization import AdamW
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Model, GPT2MLP
 from transformers import (
     GPT2LMHeadModel,
@@ -16,7 +18,11 @@ from datasets import load_dataset
 from optimum.bettertransformer import BetterTransformer
 
 
-
+#  TBD items
+#  Port domain adapter and attention mechanisms into custom module package
+#  FT dataset
+#
+#
 class MemoryWeightedAttention(nn.Module):
     """Adds retrieval-weighted attention with compressed valence representations."""
 
@@ -25,7 +31,7 @@ class MemoryWeightedAttention(nn.Module):
         hidden_size,
         num_heads,
         context_size=1024,
-        epsilon=0.066,
+        epsilon=0.061,
         ffn_dim=512,
         valence_dim=288,
     ):
@@ -46,7 +52,7 @@ class MemoryWeightedAttention(nn.Module):
         # Projection from compressed valence to attention heads
         self.valence_projection = nn.Sequential(
             nn.Linear(valence_dim, valence_dim * 2),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Dropout(0.1),
             nn.Linear(valence_dim * 2, num_heads),
             nn.Tanh(),  # Bounded output
@@ -55,18 +61,18 @@ class MemoryWeightedAttention(nn.Module):
         # Feed-Forward Network for processing combined weights
         self.ffn = nn.Sequential(
             nn.Linear(num_heads + 1, ffn_dim),  # +1 for occurrence weight
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Dropout(0.1),
             nn.Linear(ffn_dim, ffn_dim // 2),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Dropout(0.1),
             nn.Linear(ffn_dim // 2, 1),
             nn.Tanh(),  # Output in [-1, 1] range for stability
         )
 
         # Layer Normalization for feature normalization
-        self.layer_norm_valence = nn.LayerNorm(valence_dim)
-        self.layer_norm_combined = nn.LayerNorm(num_heads + 1)
+        self.layer_norm_valence = nn.LayerNorm(valence_dim, eps=1e-5)
+        self.layer_norm_combined = nn.LayerNorm(num_heads + 1, eps=1e-5)
 
     def forward(self, attention_scores, input_ids):
         """Modifies attention scores based on token frequency and compressed valence."""
@@ -83,7 +89,7 @@ class MemoryWeightedAttention(nn.Module):
         token_counts = token_counts.clamp(min=1)
 
         # Update moving memory with decay
-        decay_factor = 0.87
+        decay_factor = 0.9
         self.token_occurrence.mul_(decay_factor).add_(token_counts)
 
         # Compute occurrence weights
@@ -152,7 +158,7 @@ class ModifiedGPT2Attention(GPT2Attention):
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
         attn_weights = attn_weights / torch.sqrt(
-            torch.tensor(value.size(-1), dtype=torch.float)
+            torch.tensor(value.size(-1), dtype=torch.float, device=value.device)
         )
 
         # Get the input shape
@@ -192,13 +198,16 @@ class ValenceModule(nn.Module):
         self.domain_embeddings = nn.Embedding(num_domains, self.hidden_size // 2)
         self.domain_projection = nn.Sequential(
             nn.Linear(self.hidden_size // 2, self.hidden_size),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Linear(self.hidden_size, self.hidden_size),
         )
 
-        # Valence matrix
-        self.valence_matrix = nn.Parameter(
-            torch.randn(self.hidden_size, self.hidden_size) * 0.01
+        # 4D Valence Tensor for multi-token interaction
+        self.valence_tensor = nn.Parameter(
+            torch.randn(
+                self.hidden_size, self.hidden_size, self.hidden_size, self.hidden_size
+            )
+            * 0.01
         )
 
         self.norm = nn.LayerNorm(self.hidden_size)
@@ -206,16 +215,29 @@ class ValenceModule(nn.Module):
     def forward(self, x, domain_ids):
         # Retrieve domain-specific embeddings
         domain_embeds = self.domain_embeddings(domain_ids)  # (batch_size, hidden_size)
-        domain_proj = self.domain_projection(domain_embeds)
-        # Project valence matrix using domain embeddings
-        projected_valence = torch.matmul(
-            domain_proj, self.valence_matrix
-        )  # (batch_size, hidden_size)
+        domain_proj = self.domain_projection(domain_embeds)  # (batch_size, hidden_size)
 
-        # Apply valence transformation
-        valence_scores = torch.matmul(x, projected_valence.unsqueeze(-1)).squeeze(-1)
-        x = x + F.tanh(valence_scores)  # Adjust x with valence-based modifications
-        x = self.norm(x)  # Normalize
+        # Step 1: Compute Outer Product of x (batch_size, num_tokens, hidden_size)
+        # We'll assume x has shape (batch_size, num_tokens, hidden_size)
+        x_outer = torch.einsum(
+            "bih,bjh->bijh", x, x
+        )  # (batch_size, num_tokens, num_tokens, hidden_size)
+
+        # Step 2: Weight the Outer Product using the 4D Valence Tensor
+        weighted_interactions = torch.einsum(
+            "bijh,hijk->bik", x_outer, self.valence_tensor
+        )  # (batch_size, num_tokens, hidden_size)
+
+        # Step 3: Add domain-based projection to the weighted interactions
+        projected_valence = torch.matmul(
+            domain_proj, weighted_interactions
+        )  # (batch_size, num_tokens, hidden_size)
+
+        # Step 4: Adjust the input x with the weighted interactions
+        x = x + F.tanh(projected_valence)  # Adjust x with valence-based modifications
+
+        # Normalize the output
+        x = self.norm(x)
 
         return x
 
@@ -285,16 +307,14 @@ class FineWebDataset(Dataset):
 
 def freeze_except_modules(model, module_names=["custom_module"]):
     """"""
-    if isinstance(module_names, str):
-        module_names = [module_names]  # Ensure it's always a list
-
+    module_names = [module_names] if isinstance(module_names, str) else module_names
     for name, param in model.named_parameters():
         if any(
             module in name for module in module_names
         ):  # Check if any module matches
             param.requires_grad = True  # Keep module trainable
         else:
-            param.requires_grad = False  # Freeze everything else
+            param.requires_grad = i >= 4  # Freeze first 4 layers
 
 
 model_name = "gpt2"  # Use "gpt2-medium" or other variants if needed
@@ -309,26 +329,33 @@ freeze_except_modules(model, module_names=["mwa_module", "valence_module"])
 
 
 tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token 
 tokenizer.padding_side = "left"
-train_data = FineWebDataset(split="train[:12%]", tokenizer=tokenizer)
+train_data = FineWebDataset(split="train[22%:37%]", tokenizer=tokenizer)
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 
+# Setup TrainingArguments
 training_args = TrainingArguments(
     output_dir="./gpt2_finetuned",
-    num_train_epochs=4,  # Short run
+    num_train_epochs=2,  # Short run
     per_device_train_batch_size=24,
     save_steps=250,
-    save_total_limit=2,
-    learning_rate=2e-5,  # Adjust learning rate for the module
-    logging_steps=100,
+    save_total_limit=3,
+    learning_rate=5e-5,  # Adjust learning rate for the module
+    logging_steps=250,
+    lr_scheduler_type="cosine_with_restarts",  # Disable the default scheduler
+    lr_scheduler_kwargs={"num_cycles": 2},
+    warmup_steps=500,
 )
 
+# Initialize the Trainer with the custom scheduler
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_data,
     data_collator=data_collator,
 )
+
 
 trainer.train()
